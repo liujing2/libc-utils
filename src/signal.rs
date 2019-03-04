@@ -1,15 +1,72 @@
 // Copyright 2019 Intel Corporation. All Rights Reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::errno::{errno_result, Error, Result};
+use crate::errno::{errno_result, Error as SysError, Result};
 use libc::{
-    c_int, c_void, pthread_kill, pthread_t, sigaction, siginfo_t, EINVAL, SA_SIGINFO, SIGHUP,
-    SIGSYS,
+    c_int, c_void, pthread_kill, pthread_sigmask, pthread_t, sigaction, sigaddset, sigemptyset,
+    siginfo_t, sigismember, sigpending, sigset_t, sigtimedwait, timespec, EAGAIN, EINTR, EINVAL,
+    SIGHUP, SIGSYS, SIG_BLOCK, SIG_UNBLOCK,
 };
+use std::fmt::{self, Display};
 use std::mem;
 use std::os::unix::thread::JoinHandleExt;
+use std::ptr::{null, null_mut};
 use std::thread::JoinHandle;
+use std::{io, result};
 
+#[derive(Debug)]
+pub enum Error {
+    /// Couldn't create a sigset.
+    CreateSigset(SysError),
+    /// The wrapped signal has already been blocked.
+    SignalAlreadyBlocked(c_int),
+    /// Failed to check if the requested signal is in the blocked set already.
+    CompareBlockedSignals(SysError),
+    /// The signal could not be blocked.
+    BlockSignal(SysError),
+    /// The signal mask could not be retrieved.
+    RetrieveSignalMask(i32),
+    /// The signal could not be unblocked.
+    UnblockSignal(SysError),
+    /// Failed to wait for given signal.
+    ClearWaitPending(SysError),
+    /// Failed to get pending signals.
+    ClearGetPending(SysError),
+    /// Failed to check if given signal is in the set of pending signals.
+    ClearCheckPending(SysError),
+}
+
+impl Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use self::Error::*;
+
+        match self {
+            CreateSigset(e) => write!(f, "couldn't create a sigset: {}", e),
+            SignalAlreadyBlocked(num) => write!(f, "signal {} already blocked", num),
+            CompareBlockedSignals(e) => write!(
+                f,
+                "failed to check whether requested signal is in the blocked set: {}",
+                e,
+            ),
+            BlockSignal(e) => write!(f, "signal could not be blocked: {}", e),
+            RetrieveSignalMask(errno) => write!(
+                f,
+                "failed to retrieve signal mask: {}",
+                io::Error::from_raw_os_error(*errno),
+            ),
+            UnblockSignal(e) => write!(f, "signal could not be unblocked: {}", e),
+            ClearWaitPending(e) => write!(f, "failed to wait for given signal: {}", e),
+            ClearGetPending(e) => write!(f, "failed to get pending signals: {}", e),
+            ClearCheckPending(e) => write!(
+                f,
+                "failed to check whether given signal is in the pending set: {}",
+                e,
+            ),
+        }
+    }
+}
+
+pub type SignalResult<T> = result::Result<T, Error>;
 type SiginfoHandler = extern "C" fn(num: c_int, info: *mut siginfo_t, _unused: *mut c_void) -> ();
 
 pub enum SignalHandler {
@@ -17,13 +74,18 @@ pub enum SignalHandler {
     // TODO add a`SimpleHandler` when `libc` adds `sa_handler` support to `sigaction`.
 }
 
+impl SignalHandler {
+    fn set_flags(act: &mut sigaction, flag: c_int) {
+        act.sa_flags = flag;
+    }
+}
 /// Fills a `sigaction` structure from of the signal handler.
+/// Refer to http://man7.org/linux/man-pages/man7/signal.7.html
 impl Into<sigaction> for SignalHandler {
     fn into(self) -> sigaction {
         let mut act: sigaction = unsafe { mem::zeroed() };
         match self {
             SignalHandler::Siginfo(function) => {
-                act.sa_flags = SA_SIGINFO;
                 act.sa_sigaction = function as *const () as usize;
             }
         }
@@ -60,7 +122,7 @@ pub fn validate_signal_num(num: c_int, for_vcpu: bool) -> Result<c_int> {
     } else if SIGHUP <= num && num <= SIGSYS {
         return Ok(num);
     }
-    Err(Error::new(EINVAL))
+    Err(SysError::new(EINVAL))
 }
 
 /// Registers `handler` as the signal handler of signum `num`.
@@ -69,17 +131,149 @@ pub fn validate_signal_num(num: c_int, for_vcpu: bool) -> Result<c_int> {
 ///
 /// This is considered unsafe because the given handler will be called asynchronously, interrupting
 /// whatever the thread was doing and therefore must only do async-signal-safe operations.
+/// flags: SA_SIGINFO or SA_RESTART if wants to restart after signal received.
 pub unsafe fn register_signal_handler(
     num: i32,
     handler: SignalHandler,
     for_vcpu: bool,
+    flag: c_int,
 ) -> Result<()> {
     let num = validate_signal_num(num, for_vcpu)?;
-    let act: sigaction = handler.into();
-    match sigaction(num, &act, ::std::ptr::null_mut()) {
+    let mut act: sigaction = handler.into();
+    SignalHandler::set_flags(&mut act, flag);
+    match sigaction(num, &act, null_mut()) {
         0 => Ok(()),
         _ => errno_result(),
     }
+}
+
+/// Creates `sigset` from an array of signal numbers.
+///
+/// This is a helper function used when we want to manipulate signals.
+pub fn create_sigset(signals: &[c_int]) -> Result<sigset_t> {
+    // sigset will actually be initialized by sigemptyset below.
+    let mut sigset: sigset_t = unsafe { mem::zeroed() };
+
+    // Safe - return value is checked.
+    let ret = unsafe { sigemptyset(&mut sigset) };
+    if ret < 0 {
+        return errno_result();
+    }
+
+    for signal in signals {
+        // Safe - return value is checked.
+        let ret = unsafe { sigaddset(&mut sigset, *signal) };
+        if ret < 0 {
+            return errno_result();
+        }
+    }
+
+    Ok(sigset)
+}
+
+/// Retrieves the signal mask of the current thread as a vector of c_ints.
+pub fn get_blocked_signals() -> SignalResult<Vec<c_int>> {
+    let mut mask = Vec::new();
+
+    // Safe - return values are checked.
+    unsafe {
+        let mut old_sigset: sigset_t = mem::zeroed();
+        let ret = pthread_sigmask(SIG_BLOCK, null(), &mut old_sigset as *mut sigset_t);
+        if ret < 0 {
+            return Err(Error::RetrieveSignalMask(ret));
+        }
+
+        for num in 0..=SIGRTMAX() {
+            if sigismember(&old_sigset, num) > 0 {
+                mask.push(num);
+            }
+        }
+    }
+
+    Ok(mask)
+}
+
+/// Masks given signal.
+///
+/// If signal is already blocked the call will fail with Error::SignalAlreadyBlocked
+/// result.
+pub fn block_signal(num: c_int) -> SignalResult<()> {
+    let sigset = create_sigset(&[num]).map_err(Error::CreateSigset)?;
+
+    // Safe - return values are checked.
+    unsafe {
+        let mut old_sigset: sigset_t = mem::zeroed();
+        let ret = pthread_sigmask(SIG_BLOCK, &sigset, &mut old_sigset as *mut sigset_t);
+        if ret < 0 {
+            return Err(Error::BlockSignal(SysError::last()));
+        }
+        let ret = sigismember(&old_sigset, num);
+        if ret < 0 {
+            return Err(Error::CompareBlockedSignals(SysError::last()));
+        } else if ret > 0 {
+            return Err(Error::SignalAlreadyBlocked(num));
+        }
+    }
+    Ok(())
+}
+
+/// Unmasks given signal.
+pub fn unblock_signal(num: c_int) -> SignalResult<()> {
+    let sigset = create_sigset(&[num]).map_err(Error::CreateSigset)?;
+
+    // Safe - return value is checked.
+    let ret = unsafe { pthread_sigmask(SIG_UNBLOCK, &sigset, null_mut()) };
+    if ret < 0 {
+        return Err(Error::UnblockSignal(SysError::last()));
+    }
+    Ok(())
+}
+
+/// Clears pending signal.
+pub fn clear_signal(num: c_int) -> SignalResult<()> {
+    let sigset = create_sigset(&[num]).map_err(Error::CreateSigset)?;
+
+    while {
+        // This is safe as we are rigorously checking return values
+        // of libc calls.
+        unsafe {
+            let mut siginfo: siginfo_t = mem::zeroed();
+            let ts = timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // Attempt to consume one instance of pending signal. If signal
+            // is not pending, the call will fail with EAGAIN or EINTR.
+            let ret = sigtimedwait(&sigset, &mut siginfo, &ts);
+            if ret < 0 {
+                let e = SysError::last();
+                match e.errno() {
+                    EAGAIN | EINTR => {}
+                    _ => {
+                        return Err(Error::ClearWaitPending(SysError::last()));
+                    }
+                }
+            }
+
+            // This sigset will be actually filled with `sigpending` call.
+            let mut chkset: sigset_t = mem::zeroed();
+            // See if more instances of the signal are pending.
+            let ret = sigpending(&mut chkset);
+            if ret < 0 {
+                return Err(Error::ClearGetPending(SysError::last()));
+            }
+
+            let ret = sigismember(&chkset, num);
+            if ret < 0 {
+                return Err(Error::ClearCheckPending(SysError::last()));
+            }
+
+            // This is do-while loop condition.
+            ret != 0
+        }
+    } {}
+
+    Ok(())
 }
 
 /// Trait for threads that can be signalled via `pthread_kill`.
@@ -118,7 +312,7 @@ unsafe impl<T> Killable for JoinHandle<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libc;
+    use libc::SA_SIGINFO;
     use std::thread;
     use std::time::Duration;
 
@@ -137,20 +331,31 @@ mod tests {
             assert!(register_signal_handler(
                 SIGRTMAX(),
                 SignalHandler::Siginfo(handle_signal),
-                true
+                true,
+                SA_SIGINFO
             )
             .is_err());
             format!(
                 "{:?}",
-                register_signal_handler(SIGRTMAX(), SignalHandler::Siginfo(handle_signal), true)
+                register_signal_handler(
+                    SIGRTMAX(),
+                    SignalHandler::Siginfo(handle_signal),
+                    true,
+                    SA_SIGINFO
+                )
             );
-            assert!(
-                register_signal_handler(0, SignalHandler::Siginfo(handle_signal), true).is_ok()
-            );
+            assert!(register_signal_handler(
+                0,
+                SignalHandler::Siginfo(handle_signal),
+                true,
+                SA_SIGINFO
+            )
+            .is_ok());
             assert!(register_signal_handler(
                 libc::SIGSYS,
                 SignalHandler::Siginfo(handle_signal),
-                false
+                false,
+                SA_SIGINFO
             )
             .is_ok());
         }
@@ -166,7 +371,7 @@ mod tests {
         // be brought down when the signal is received, as part of the default behaviour. Signal
         // handlers are global, so we install this before starting the thread.
         unsafe {
-            register_signal_handler(0, SignalHandler::Siginfo(handle_signal), true)
+            register_signal_handler(0, SignalHandler::Siginfo(handle_signal), true, SA_SIGINFO)
                 .expect("failed to register vcpu signal handler");
         }
 
