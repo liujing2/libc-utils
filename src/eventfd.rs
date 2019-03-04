@@ -92,6 +92,14 @@ impl AsRawFd for EventFd {
     }
 }
 
+impl FromRawFd for EventFd {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        EventFd {
+            eventfd: File::from_raw_fd(fd),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
